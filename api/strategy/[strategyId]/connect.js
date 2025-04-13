@@ -1,81 +1,54 @@
-import axios from "axios";
-import { createClient } from "@supabase/supabase-js";
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
-const METAAPI_TOKEN = process.env.METAAPI_TOKEN;
+import { createClient } from '@supabase/supabase-js';
+import { NextResponse } from 'next/server';
 
-export default async function connect(req, res) {
-  const { strategyId } = req.params;
-  const { login, password, server, platform } = req.body;
+// MetaApi config
+const metaapi = require('metaapi.cloud-sdk').default;
+const token = process.env.METAAPI_TOKEN;
+const api = new metaapi(token);
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_KEY
+);
+
+export async function POST(req, { params }) {
+  const strategyId = params.strategyId;
+
+  // 1. Get login credentials from Supabase
+  const { data: account, error } = await supabase
+    .from('linked_accounts')
+    .select('*')
+    .eq('strategy_id', strategyId)
+    .single();
+
+  if (error || !account) {
+    return NextResponse.json({ error: 'Linked account not found' }, { status: 404 });
+  }
+
+  const { login, password, server, platform } = account;
 
   try {
-    const createRes = await axios.post(
-      'https://mt-provisioning-api-v1.agiliumtrade.ai/users/current/accounts',
-      {
-        name: `strategy-${strategyId}`,
-        login,
-        password,
-        server,
-        platform,
-        type: 'cloud'
-      },
-      { headers: { Authorization: `Bearer ${METAAPI_TOKEN}` } }
-    );
+    // 2. Connect to MetaApi
+    const connection = await api.connect();
+    const account = await api.provisioningApi.getAccount(login);
 
-    const accountId = createRes.data.id;
-    let deployed = false;
-    let retries = 0;
+    await account.deploy();
+    await account.waitConnected();
 
-    while (!deployed && retries < 10) {
-      const check = await axios.get(
-        `https://mt-provisioning-api-v1.agiliumtrade.ai/users/current/accounts/${accountId}`,
-        {
-          headers: { Authorization: `Bearer ${METAAPI_TOKEN}` }
-        }
-      );
+    const metrics = await account.getMetrics();
 
-      if (check.data.state === 'DEPLOYED') {
-        deployed = true;
-      } else {
-        await new Promise((r) => setTimeout(r, 5000));
-        retries++;
-      }
-    }
-
-    if (!deployed) return res.status(408).json({ error: 'MetaApi deployment timed out.' });
-
-    const metricsRes = await axios.get(
-      `https://metastats-api-v1.agiliumtrade.ai/users/current/accounts/${accountId}/metrics`,
-      {
-        headers: { Authorization: `Bearer ${METAAPI_TOKEN}` }
-      }
-    );
-
-    const metrics = metricsRes.data;
-
-    const { error } = await supabase.from('strategy_stats').upsert({
+    // 3. Store metrics in Supabase
+    await supabase.from('strategy_stats').upsert({
       strategy_id: strategyId,
-      account_id: accountId,
-      profit_percentage: metrics.profitPercentage,
-      win_rate: metrics.winRate,
-      total_trades: metrics.totalTrades,
-      max_drawdown: metrics.maxDrawdown,
-      avg_rr: metrics.avgRr,
-      synced_at: new Date()
-    });
+      metrics,
+      synced_at: new Date().toISOString()
+    }, { onConflict: 'strategy_id' });
 
-    if (error) return res.status(500).json({ error: error.message });
+    return NextResponse.json({ success: true, metrics });
 
-    res.status(200).json({
-      success: true,
-      strategy_id: strategyId,
-      account_id: accountId,
-      metrics
-    });
   } catch (err) {
-    console.error(err.response?.data || err.message);
-    res.status(500).json({
-      error: err.response?.data || err.message
-    });
+    console.error(err);
+    return NextResponse.json({ error: 'MetaApi error', details: err.message }, { status: 500 });
   }
 }
